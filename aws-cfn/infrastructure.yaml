@@ -1,0 +1,276 @@
+---
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: Serverless infrastructure for massive mail sender
+
+Parameters:
+  Project:
+    Description: Label for project
+    Type: String
+
+  SourceEmailAddress:
+    Description: Amazon SES-verified sender email address
+    Type: String
+
+  SourceEmailIdentity:
+    Description: Email standard sender identity
+    Type: String
+
+  ApiGateway:
+    Description: The API Gateway identifier
+    Type: String
+
+  SecretToken:
+    Description: Token for lambda authorizer
+    Type: String
+
+Resources:
+  ReceiptsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${Project}-ReceiptsTable"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: mail
+          AttributeType: S
+      KeySchema:
+        - AttributeName: mail
+          KeyType: HASH
+
+  SendEmailLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Project}-SendEmailLambdaRole"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+  SendEmailLambdaPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${Project}-SendEmailLambdaPolicy"
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+          - Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${SendEmailLambda}:*"
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:BatchGetItem
+              - dynamodb:Scan
+              - dynamodb:Query
+              - dynamodb:ConditionCheckItem
+            Resource: !GetAtt ReceiptsTable.Arn
+          - Effect: Allow
+            Action:
+              - ses:SendEmail
+              - ses:SendRawEmail
+            Resource: "*"
+            Condition:
+              StringEquals:
+                ses:FromAddress:
+                  - !Ref SourceEmailAddress
+      Roles: [!Ref SendEmailLambdaRole]
+    DependsOn: [SendEmailLambdaRole, SendEmailLambda]
+
+  SendEmailLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Project}-SendEmailLambda"
+      Runtime: nodejs12.x
+      Handler: index.handler
+      Role: !GetAtt SendEmailLambdaRole.Arn
+      Environment:
+        Variables:
+          RECEIPTS_TABLE: !Ref ReceiptsTable
+          SOURCE_IDENTITY: !Ref SourceEmailIdentity
+      Code:
+        ZipFile: |
+          var aws = require("aws-sdk");
+          var ses = new aws.SES({ region: "eu-west-1" });
+          var dynamodb = new aws.DynamoDB.DocumentClient();
+          async function getAllReceipts () {
+            var addresses, ExclusiveStartKey;
+            var all_addresses = [];
+            do {
+              addresses = await dynamodb.scan({
+                TableName: process.env.RECEIPTS_TABLE,
+                ExclusiveStartKey,
+              }).promise();
+              ExclusiveStartKey = addresses.LastEvaluatedKey;
+              addresses.Items.forEach((address) => all_addresses.push(address["mail"]));
+            } while (addresses.LastEvaluatedKey);
+            return all_addresses;
+          }
+          async function sendSingleMail (receipt, subject, body) {
+            var params = {
+              Source: process.env.SOURCE_IDENTITY,
+              Destination: {
+                ToAddresses: [receipt],
+              },
+              Message: {
+                Subject: {
+                  Charset: "UTF-8",
+                  Data: subject
+                },
+                Body: {
+                  Html: {
+                    Charset: "UTF-8",
+                    Data: body
+                  },
+                },
+              },
+            };
+            return ses.sendEmail(params).promise();
+          }
+          async function createResponse (code, message) {
+            var responseBody = { "message": message };
+            var response = {
+              statusCode: code,
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(responseBody)
+            };
+            console.log(response);
+            return response;
+          }
+          exports.handler = async function (event) {
+            var all_receipts = [];
+            var counter = 0;
+            var data;
+            console.log(event);
+            console.log(event.body);
+            if (event.body == null) {
+              console.log("There's no body on the request.");
+              return await createResponse(400, "Bad Request");
+            }
+            try {
+              data = JSON.parse(event.body);
+            } catch (exception) {
+              console.log(exception);
+              return await createResponse(400, "Bad Request");
+            }
+            if (!data.subject || !data.body) {
+              console.log("There's no subject/body in request's body.");
+              return await createResponse(400, "Bad Request");
+            }
+            all_receipts = await getAllReceipts();
+            for (let receipt of all_receipts) {
+              var messageId = await sendSingleMail(receipt, data.subject, data.body);
+              console.log(messageId);
+              counter++;
+            }
+            var message = "Sent " + counter + " mail";
+            return await createResponse(200, message);
+          };
+    DependsOn: [SendEmailLambdaRole, ReceiptsTable]
+
+  SendEmailLambdaLogsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${SendEmailLambda}"
+      RetentionInDays: 30
+    DependsOn: SendEmailLambda
+
+  SendEmailLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SendEmailLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*/${Project}/mail"
+    DependsOn: SendEmailLambda
+
+  LambdaAuthRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Project}-LambdaAuthRole"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+  LambdaAuth:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Project}-LambdaAuth"
+      Runtime: nodejs12.x
+      Handler: index.handler
+      Role: !GetAtt LambdaAuthRole.Arn
+      Environment:
+        Variables:
+          SECRET_TOKEN: !Ref SecretToken
+      Code:
+        ZipFile: |
+          exports.handler = async(event) => {
+            let response = {
+              "isAuthorized": false
+            };
+            if (event.headers.authorization === process.env.SECRET_TOKEN) {
+              response = {
+                "isAuthorized": true
+              };
+            }
+            return response;
+          };
+    DependsOn: LambdaAuthRole
+
+  LambdaAuthPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt LambdaAuth.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/authorizers/${ApiAuthorizer}"
+    DependsOn: [LambdaAuth, ApiAuthorizer]
+
+  SendEmailIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGateway
+      ConnectionType: INTERNET
+      IntegrationType: AWS_PROXY
+      IntegrationMethod: POST
+      IntegrationUri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SendEmailLambda.Arn}/invocations"
+      PayloadFormatVersion: 2.0
+    DependsOn: SendEmailLambda
+
+  ApiAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      Name: !Sub "${Project}-ApiAuthorizer"
+      ApiId: !Ref ApiGateway
+      AuthorizerType: REQUEST
+      AuthorizerPayloadFormatVersion: 2.0
+      AuthorizerUri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaAuth.Arn}/invocations"
+      AuthorizerResultTtlInSeconds: 300
+      EnableSimpleResponses: true
+      IdentitySource:
+        - $request.header.Authorization
+    DependsOn: LambdaAuth
+
+  SendEmailRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      RouteKey: !Sub "POST /${Project}/mail"
+      Target: !Sub "integrations/${SendEmailIntegration}"
+    DependsOn: [ApiAuthorizer, SendEmailIntegration]
